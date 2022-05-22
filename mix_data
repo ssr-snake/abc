@@ -1,0 +1,662 @@
+#!/home/jiang/anaconda3/bin/python
+
+import soundfile
+import csv
+import librosa
+import os
+import numpy as np
+import h5py
+
+#scaler = _pickle.load(open('workspace/scalers/feature_standard_scaler.p', 'rb'))
+#mean = scaler.mean_
+#var = scaler.var_
+
+_MEL_BREAK_FREQUENCY_HERTZ = 700.0
+_MEL_HIGH_FREQUENCY_Q = 1127.0
+workspace = 'workspace'
+speech_dir ='speech'
+noise_dir = 'noise'
+fs = 16000
+n_concat = 7
+n_hop = 1
+win_len = 512
+hop_len = 256
+PI = 3.14159265358979323846
+win = np.zeros([512])
+n = 512
+k = 9
+
+def create_folder(fd):
+    if not os.path.exists(fd):
+        os.makedirs(fd)
+
+def calc_sp(audio, mode):
+    n_window = win_len
+    n_overlap = hop_len
+    x = librosa.stft(audio,
+                     n_fft=n_window,
+                     hop_length=n_overlap,
+                     window="hamming",
+                     center=False)
+    x = x.T
+    if mode == 'magnitude':
+        x = np.abs(x)
+        x = x.astype(np.float32)
+    elif mode == 'complex':
+        x = x.astype(np.complex64)
+    else:
+        raise Exception("Incorrect mode!")
+    return x
+
+def log_sp(x):
+    return np.log(x + 1e-4)
+
+def HertzToMel(frequencies_hertz):
+  return _MEL_HIGH_FREQUENCY_Q * np.log(1.0 + (frequencies_hertz / _MEL_BREAK_FREQUENCY_HERTZ))
+
+def MelToHertz(frequencies_mel):
+    """Convert frequencies to mel scale using HTK formula.
+
+    Args:
+      frequencies_hertz: Scalar or np.array of frequencies in hertz.
+
+    Returns:
+      Object of same size as frequencies_hertz containing corresponding values
+      on the mel scale.
+    """
+
+    return _MEL_BREAK_FREQUENCY_HERTZ * (np.exp(frequencies_mel / _MEL_HIGH_FREQUENCY_Q) - 1)
+
+def SpectrogramToMelMatrix(num_mel_bins=32, num_spectrogram_bins=129,audio_sample_rate=16000,
+                           lower_edge_hertz=0.0,upper_edge_hertz=8000.0):
+    nyquist_hertz = audio_sample_rate / 2.
+    if lower_edge_hertz < 0.0:
+        raise ValueError("lower_edge_hertz %.1f must be >= 0" % lower_edge_hertz)
+    if lower_edge_hertz >= upper_edge_hertz:
+        raise ValueError("lower_edge_hertz %.1f >= upper_edge_hertz %.1f" %
+                     (lower_edge_hertz, upper_edge_hertz))
+    if upper_edge_hertz > nyquist_hertz:
+        raise ValueError("upper_edge_hertz %.1f is greater than Nyquist %.1f" %
+                     (upper_edge_hertz, nyquist_hertz))
+    spectrogram_bins_hertz = np.linspace(0.0, nyquist_hertz, num_spectrogram_bins)
+    spectrogram_bins_mel = HertzToMel(spectrogram_bins_hertz)
+    band_edges_mel = np.linspace(HertzToMel(lower_edge_hertz),
+                               HertzToMel(upper_edge_hertz), num_mel_bins + 2)
+    mel_weights_matrix = np.empty((num_spectrogram_bins, num_mel_bins))
+    for i in range(num_mel_bins):
+        lower_edge_mel, center_mel, upper_edge_mel = band_edges_mel[i:i + 3]
+        lower_slope = ((spectrogram_bins_mel - lower_edge_mel) /
+                   (center_mel - lower_edge_mel))
+        upper_slope = ((upper_edge_mel - spectrogram_bins_mel) /
+                   (upper_edge_mel - center_mel))
+        mel_weights_matrix[:, i] = np.maximum(0.0, np.minimum(lower_slope,
+                                                          upper_slope))
+    mel_weights_matrix[0, :] = 0.0
+    return mel_weights_matrix
+
+
+def MelToSpectrogramMatrix(num_mel_bins=20, num_spectrogram_bins=129, audio_sample_rate=8000,
+                           lower_edge_hertz=125.0, upper_edge_hertz=3800.0):
+
+    nyquist_hertz = audio_sample_rate / 2.
+    if lower_edge_hertz < 0.0:
+        raise ValueError("lower_edge_hertz %.1f must be >= 0" % lower_edge_hertz)
+    if lower_edge_hertz >= upper_edge_hertz:
+        raise ValueError("lower_edge_hertz %.1f >= upper_edge_hertz %.1f" %
+                         (lower_edge_hertz, upper_edge_hertz))
+    if upper_edge_hertz > nyquist_hertz:
+        raise ValueError("upper_edge_hertz %.1f is greater than Nyquist %.1f" %
+                         (upper_edge_hertz, nyquist_hertz))
+    spectrogram_bins_hertz = np.linspace(0.0, nyquist_hertz, num_spectrogram_bins)
+
+    # The i'th mel band (starting from i=1) has center frequency
+    # band_edges_mel[i], lower edge band_edges_mel[i-1], and higher edge
+    # band_edges_mel[i+1].  Thus, we need num_mel_bins + 2 values in
+    # the band_edges_mel arrays.
+    band_edges_mel = np.linspace(HertzToMel(lower_edge_hertz),
+                                 HertzToMel(upper_edge_hertz), num_mel_bins + 2)
+    band_edges_hertz = MelToHertz(band_edges_mel)
+    hertz_weight_matrix = np.zeros(shape=(num_spectrogram_bins, num_mel_bins), dtype=np.float32)
+    mel_center_hertz = band_edges_hertz[1:num_mel_bins + 1]
+    for row in range(num_spectrogram_bins):
+        hertz = spectrogram_bins_hertz[row]
+        for col in range(num_mel_bins):
+            upper_hertz = mel_center_hertz[col]
+            if col == 0:
+                lower_hertz = 0.0
+            else:
+                lower_hertz = mel_center_hertz[col - 1]
+            if hertz >= lower_hertz and hertz < upper_hertz:
+                band_gap = abs(upper_hertz - lower_hertz)
+                lower_gap = abs(hertz - lower_hertz)
+                upper_gap = abs(hertz - upper_hertz)
+
+                if col == 0:
+                    hertz_weight_matrix[row][col] = lower_gap / band_gap
+                else:
+                    hertz_weight_matrix[row][col - 1] = upper_gap / band_gap
+                    hertz_weight_matrix[row][col] = lower_gap / band_gap
+            elif col == (num_mel_bins - 1) and hertz >= upper_hertz:
+                band_gap = abs(nyquist_hertz - upper_hertz)
+                lower_gap = abs(hertz - upper_hertz)
+                hertz_weight_matrix[row][col] = (band_gap - lower_gap) / band_gap
+    # hertz_weight_matrix = np.transpose(hertz_weight_matrix)
+    # print("hertz_weight_matrix:")
+    # print(hertz_weight_matrix)
+
+    return hertz_weight_matrix
+
+def mat_2d_to_3d(x, agg_num, hop):
+    """Segment 2D array to 3D segments.
+    """
+    # Pad to at least one block.
+    len_x, n_in = x.shape
+    if (len_x < agg_num):
+        x = np.concatenate((x, np.zeros((agg_num - len_x, n_in))))
+
+    # Segment 2d to 3d.
+    len_x = len(x)
+    i1 = 0
+    x3d = []
+    while (i1 + agg_num <= len_x):
+        y = x[i1: i1 + agg_num]
+        x3d.append(y)
+        i1 += hop
+    return np.array(x3d)
+
+def pad_with_border(x, n_pad1, n_pad2):
+    """Pad the begin and finish of spectrogram with border frame value.
+    """
+    x_pad_list = [x[0:1]] * n_pad1 + [x] + [x[-1:]] * n_pad2
+    return np.concatenate(x_pad_list, axis=0)
+
+def read_audio(path: object, target_fs: object = None) -> object:
+    (audio, fs) = soundfile.read(path)
+    '''audio = audio * 32768
+    a = max(audio)
+    b = min(audio)'''
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    if target_fs is not None and fs != target_fs:
+        audio = librosa.resample(audio, orig_sr=fs, target_sr=target_fs)
+        fs = target_fs
+    return audio, fs
+
+def write_audio(path, audio, sample_rate):
+    soundfile.write(file=path, data=audio, samplerate=sample_rate)
+
+def additive_mixing(s, n):
+    mixed_audio = s + n
+    return mixed_audio
+
+def calc_sp2(audio, win, n, k):
+    m = int(np.floor(len(audio)/(n/2))) - 1
+    st = np.zeros([m, n])
+    sp = np.zeros([m, int(n/2+1)])
+    for i in range(m):
+        st[i, :] = audio[i*128:(i+2)*128] * win
+    for ii in range(m):
+        pi = np.zeros([n])
+        fr = np.zeros([n])
+        fi = np.zeros([n])
+        pr = st[ii, :]
+        for it in range(n):
+            m = it
+            iss = 0
+            for i in range(k):
+                j = int(np.floor(m / 2))
+                iss = 2 * iss + (m - 2 * j)
+                m = j
+            fr[it] = pr[iss]
+            fi[it] = pi[iss]
+        pr[0] = 1.0
+        pi[0] = 0.0
+        p = 2 * PI / (1.0 * n)
+        pr[1] = np.cos(p)
+        pi[1] = -np.sin(p)
+        for i in range(2, n, 1):
+            p = pr[i - 1] * pr[1]
+            q = pi[i - 1] * pi[1]
+            s = (pr[i - 1] + pi[i - 1]) * (pr[1] + pi[1])
+            pr[i] = p - q
+            pi[i] = s - p - q
+        for it in range(0, n, 2):
+            vr = fr[it]
+            vi = fi[it]
+            fr[it] = vr + fr[it + 1]
+            fi[it] = vi + fi[it + 1]
+            fr[it + 1] = vr - fr[it + 1]
+            fi[it + 1] = vi - fi[it + 1]
+        m = n / 2
+        nv = 2
+        for l0 in range(k - 2, -1, -1):
+            m = int(np.floor(m / 2))
+            nv = 2 * nv
+            for it in range(0, m * nv, nv):
+                for j in range(0, int(np.floor(nv / 2)), 1):
+                    p = pr[m * j] * fr[it + j + int(np.floor(nv / 2))]
+                    q = pi[m * j] * fi[it + j + int(np.floor(nv / 2))]
+                    s = pr[m * j] + pi[m * j]
+                    s = s * (fr[it + j + int(np.floor(nv / 2))] + fi[it + j + int(np.floor(nv / 2))])
+                    poddr = p - q
+                    poddi = s - p - q
+                    fr[it + j + int(np.floor(nv / 2))] = fr[it + j] - poddr
+                    fi[it + j + int(np.floor(nv / 2))] = fi[it + j] - poddi
+                    fr[it + j] = fr[it + j] + poddr
+                    fi[it + j] = fi[it + j] + poddi
+        for i in range(129):
+            sp[ii][i] = np.sqrt(fr[i] * fr[i] + fi[i] * fi[i])
+    return sp
+
+def rms(y):
+    return np.sqrt(np.mean(np.abs(y) ** 2, axis=0, keepdims=False))
+
+def get_amplitude_scaling_factor(s, n, snr, method='rms'):
+    """Given s and n, return the scaler s according to the snr.
+    Args:
+      s: ndarray, source1.
+      n: ndarray, source2.
+      snr: float, SNR.
+      method: 'rms'.
+    Outputs:
+      float, scaler.
+    """
+    original_sn_rms_ratio = rms(s) / rms(n)
+    target_sn_rms_ratio = 10. ** (float(snr) / 20.)  # snr = 20 * lg(rms(s) / rms(n))
+    signal_scaling_factor = target_sn_rms_ratio / original_sn_rms_ratio
+    return signal_scaling_factor
+
+
+speech_names = [na for na in os.listdir(speech_dir) if na.lower().endswith(".wav")]
+noise_names = [na for na in os.listdir(noise_dir) if na.lower().endswith(".wav")]
+out_csv_path = os.path.join(workspace, "mixture_csvs", "mixture.csv")
+create_folder(os.path.dirname(out_csv_path))
+f = open(out_csv_path, 'w')
+f.write("%s\t%s\n" % ("speech_name", "noise_name"))
+nn = len(noise_names)
+for i in range(len(speech_names)):
+    j = i % nn
+    f.write("%s\t%s\n" % (speech_names[i], noise_names[j]))
+f.close()
+mixture_csv_path = os.path.join(workspace, "mixture_csvs", "mixture.csv")
+with open(mixture_csv_path, 'r') as f:
+    reader = csv.reader(f, delimiter='\t')
+    lis = list(reader)
+Hmel = SpectrogramToMelMatrix(num_mel_bins=40, num_spectrogram_bins=257, audio_sample_rate=16000,
+                              lower_edge_hertz=0.0, upper_edge_hertz=8000.0)
+
+
+for i1 in range(1, len(lis)):
+    [speech_na, noise_na] = lis[i1]
+    speech_path = os.path.join(speech_dir, speech_na)
+    (speech_audio, _) = read_audio(speech_path, target_fs=fs)
+    noise_path = os.path.join(noise_dir, noise_na)
+    (noise_audio, _) = read_audio(noise_path, target_fs=fs)
+    if len(noise_audio) < len(speech_audio):
+        n_repeat = int(np.ceil(float(len(speech_audio)) / float(len(noise_audio))))
+        noise_audio_ex = np.tile(noise_audio, n_repeat)
+        noise_audio = noise_audio_ex[0: len(speech_audio)]
+    else:
+        noise_audio = noise_audio[0: len(speech_audio)]
+
+    scaler1 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=8)
+    scaler2 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=10)
+    scaler3 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=15)
+    noise_audio1 = noise_audio * (1 / scaler1)
+    noise_audio2 = noise_audio * (1 / scaler2)
+    noise_audio3 = noise_audio * (1 / scaler3)
+    mixed_audio1 = additive_mixing(speech_audio, noise_audio1)
+    mixed_audio2 = additive_mixing(speech_audio, noise_audio2)
+    mixed_audio3 = additive_mixing(speech_audio, noise_audio3)
+    out_bare_na1 = os.path.join("%s_%s_1" % (os.path.splitext(speech_na)[0], os.path.splitext(noise_na)[0]))
+    out_bare_na2 = os.path.join("%s_%s_2" % (os.path.splitext(speech_na)[0], os.path.splitext(noise_na)[0]))
+    out_bare_na3 = os.path.join("%s_%s_3" % (os.path.splitext(speech_na)[0], os.path.splitext(noise_na)[0]))
+    out_audio_path1 = os.path.join(workspace, "mixed_audios", "%s.wav" % out_bare_na1)
+    out_audio_path2 = os.path.join(workspace, "mixed_audios", "%s.wav" % out_bare_na2)
+    out_audio_path3 = os.path.join(workspace, "mixed_audios", "%s.wav" % out_bare_na3)
+    create_folder(os.path.dirname(out_audio_path1))
+    create_folder(os.path.dirname(out_audio_path2))
+    create_folder(os.path.dirname(out_audio_path3))
+    write_audio(out_audio_path1, mixed_audio1, fs)
+    write_audio(out_audio_path2, mixed_audio2, fs)
+    write_audio(out_audio_path3, mixed_audio3, fs)
+
+    speech_sp = calc_sp(speech_audio, 'magnitude')
+
+    mixed_sp1 = calc_sp(mixed_audio1, 'magnitude')
+    noise_sp1 = calc_sp(noise_audio1, 'magnitude')
+    irm1 = speech_sp / (noise_sp1 + speech_sp)
+    y_feature1 = irm1[6:]
+    mixed_mfcc1 = np.dot(mixed_sp1, Hmel)
+    mixed_x_3d1 = mat_2d_to_3d(mixed_mfcc1, agg_num=n_concat, hop=n_hop)
+    #x_feature1 = log_sp(mixed_x_3d1).astype(np.float32)
+    x_feature1 = mixed_x_3d1.astype(np.float32)
+    feature_name1 = out_bare_na1 + "_data.h5"
+    out_path = os.path.join(workspace, "features", feature_name1)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature1)
+        hf.create_dataset('y', data=y_feature1)
+
+    mixed_sp2 = calc_sp(mixed_audio2, 'magnitude')
+    noise_sp2 = calc_sp(noise_audio2, 'magnitude')
+    irm2 = speech_sp / (noise_sp2 + speech_sp)
+    #irm2 = speech_sp / mixed_sp2
+    y_feature2 = irm2[6:]
+    mixed_mfcc2 = np.dot(mixed_sp2, Hmel)
+    mixed_x_3d2 = mat_2d_to_3d(mixed_mfcc2, agg_num=n_concat, hop=n_hop)
+    #x_feature2 = log_sp(mixed_x_3d2).astype(np.float32)
+    x_feature2 = mixed_x_3d2.astype(np.float32)
+    feature_name2 = out_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features", feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature2)
+        hf.create_dataset('y', data=y_feature2)
+
+    mixed_sp3 = calc_sp(mixed_audio3, 'magnitude')
+    noise_sp3 = calc_sp(noise_audio3, 'magnitude')
+    irm3 = speech_sp / (noise_sp3 + speech_sp)
+    y_feature3 = irm3[6:]
+    mixed_mfcc3 = np.dot(mixed_sp3, Hmel)
+    mixed_x_3d3 = mat_2d_to_3d(mixed_mfcc3, agg_num=n_concat, hop=n_hop)
+    #x_feature3 = log_sp(mixed_x_3d3).astype(np.float32)
+    x_feature3 = mixed_x_3d3.astype(np.float32)
+    feature_name3 = out_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features", feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature3)
+        hf.create_dataset('y', data=y_feature3)
+
+    flag = 1
+
+'''
+    mixed_sp2 = calc_sp(mixed_audio2, win, n, k)
+    mixed_mfcc2 = np.dot(mixed_sp2, Hmel)
+    mixed_x_3d2 = mat_2d_to_3d(mixed_mfcc2, agg_num=n_concat, hop=n_hop)
+    x_feature2 = log_sp(mixed_x_3d2).astype(np.float32)
+    feature_name2 = out_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature2)
+        hf.create_dataset('y', data=y_feature)
+    mixed_sp3 = calc_sp(mixed_audio3, win, n, k)
+    mixed_mfcc3 = np.dot(mixed_sp3, Hmel)
+    mixed_x_3d3 = mat_2d_to_3d(mixed_mfcc3, agg_num=n_concat, hop=n_hop)
+    x_feature3 = log_sp(mixed_x_3d3).astype(np.float32)
+    feature_name3 = out_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature3)
+        hf.create_dataset('y', data=y_feature)'''
+
+'''for i1 in range(1, len(lis)):
+    [speech_na, noise_na] = lis[i1]
+    speech_path = os.path.join(speech_dir, speech_na)
+    (speech_audio, _) = read_audio(speech_path, target_fs=fs)
+    sframes = enframe(speech_audio, win_len, hop_len)
+    percent_high_nrg = 0.05
+    vad = nrg_vad(sframes, percent_high_nrg)
+    noise_path = os.path.join(noise_dir, noise_na)
+    (noise_audio, _) = read_audio(noise_path, target_fs=fs)
+    vad = vad[2:-2, :]
+    y_feature = np.zeros([len(vad), 8])
+    z_feature = np.zeros([len(vad), 8])
+    for i in range(len(vad)):
+        if vad[i] == 1:
+            for j in range(8):
+                y_feature[i, j] = 1
+
+    if len(noise_audio) < len(speech_audio):
+        n_repeat = int(np.ceil(float(len(speech_audio)) / float(len(noise_audio))))
+        noise_audio_ex = np.tile(noise_audio, n_repeat)
+        noise_audio = noise_audio_ex[0: len(speech_audio)]
+    else:
+        noise_audio = noise_audio[0: len(speech_audio)]
+
+    noise_audio1 = noise_audio
+    noise_audio2 = noise_audio / 2
+    noise_audio3 = noise_audio / 3
+    noise_bare_na1 = os.path.join("%s_%d_05db" % (os.path.splitext(noise_na)[0], i1))
+    noise_bare_na2 = os.path.join("%s_%d_10db" % (os.path.splitext(noise_na)[0], i1))
+    noise_bare_na3 = os.path.join("%s_%d_15db" % (os.path.splitext(noise_na)[0], i1))
+    scaler1 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=10)
+    noise_sp1 = calc_sp(noise_audio1, 'magnitude')
+    noise_mfcc1 = np.dot(noise_sp1, Hmel)
+    noise_x_3d1 = mat_2d_to_3d(noise_mfcc1, agg_num=n_concat, hop=n_hop)
+    noise_feature1 = log_sp(noise_x_3d1).astype(np.float32)
+    noise_feature_name1 = noise_bare_na1 + "_data.h5"
+    out_path = os.path.join(workspace, "features", noise_feature_name1)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=noise_feature1)
+        hf.create_dataset('y', data=z_feature)
+    noise_sp2 = calc_sp(noise_audio2, 'magnitude')
+    noise_mfcc2 = np.dot(noise_sp2, Hmel)
+    noise_x_3d2 = mat_2d_to_3d(noise_mfcc2, agg_num=n_concat, hop=n_hop)
+    noise_feature2 = log_sp(noise_x_3d2).astype(np.float32)
+    noise_feature_name2 = noise_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features", noise_feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=noise_feature2)
+        hf.create_dataset('y', data=z_feature)
+    noise_sp3 = calc_sp(noise_audio3, 'magnitude')
+    noise_mfcc3 = np.dot(noise_sp3, Hmel)
+    noise_x_3d3 = mat_2d_to_3d(noise_mfcc3, agg_num=n_concat, hop=n_hop)
+    noise_feature3 = log_sp(noise_x_3d3).astype(np.float32)
+    noise_feature_name3 = noise_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features", noise_feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=noise_feature3)
+        hf.create_dataset('y', data=z_feature)
+
+    speech_audio1 = speech_audio
+    speech_audio2 = speech_audio / 1.5
+    speech_audio3 = speech_audio / 2
+    speech_bare_na1 = os.path.join("%s_5db" % (os.path.splitext(speech_na)[0]))
+    speech_bare_na2 = os.path.join("%s_10db" % (os.path.splitext(speech_na)[0]))
+    speech_bare_na3 = os.path.join("%s_15db" % (os.path.splitext(speech_na)[0]))
+
+    speech_sp1 = calc_sp(speech_audio1, 'magnitude')
+    speech_mfcc1 = np.dot(speech_sp1, Hmel)
+    speech_x_3d1 = mat_2d_to_3d(speech_mfcc1, agg_num=n_concat, hop=n_hop)
+    speech_feature1 = log_sp(speech_x_3d1).astype(np.float32)
+    speech_feature_name1 = speech_bare_na1 + "_data.h5"
+    out_path = os.path.join(workspace, "features", speech_feature_name1)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=speech_feature1)
+        hf.create_dataset('y', data=y_feature)
+    speech_sp2 = calc_sp(speech_audio2, 'magnitude')
+    speech_mfcc2 = np.dot(speech_sp2, Hmel)
+    speech_x_3d2 = mat_2d_to_3d(speech_mfcc2, agg_num=n_concat, hop=n_hop)
+    speech_feature2 = log_sp(speech_x_3d2).astype(np.float32)
+    speech_feature_name2 = speech_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features", speech_feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=speech_feature2)
+        hf.create_dataset('y', data=y_feature)
+    speech_sp3 = calc_sp(speech_audio3, 'magnitude')
+    speech_mfcc3 = np.dot(speech_sp3, Hmel)
+    speech_x_3d3 = mat_2d_to_3d(speech_mfcc3, agg_num=n_concat, hop=n_hop)
+    speech_feature3 = log_sp(speech_x_3d3).astype(np.float32)
+    speech_feature_name3 = speech_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features", speech_feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=speech_feature3)
+        hf.create_dataset('y', data=y_feature)
+
+    print(i1)'''
+
+'''for i1 in range(1, len(lis)):
+    [speech_na, noise_na] = lis[i1]
+    speech_path = os.path.join(speech_dir, speech_na)
+    (speech_audio, _) = read_audio(speech_path, target_fs=fs)
+    s = speech_audio
+    sframes = enframe(s, win_len, hop_len)
+    percent_high_nrg = 0.05
+    vad = nrg_vad(sframes, percent_high_nrg)
+    org_vad = vad
+
+    noise_path = os.path.join(noise_dir, noise_na)
+    (noise_audio, _) = read_audio(noise_path, target_fs=fs)
+    vad = vad[5:-1, :]
+    y_feature = np.zeros([len(vad), 5])
+    z_feature = np.zeros([len(vad), 5])
+    for i in range(len(vad)):
+        if vad[i] == 1:
+            for j in range(5):
+                y_feature[i, j] = 1
+
+    if len(noise_audio) < len(speech_audio):
+        n_repeat = int(np.ceil(float(len(speech_audio)) / float(len(noise_audio))))
+        noise_audio_ex = np.tile(noise_audio, n_repeat)
+        noise_audio = noise_audio_ex[0: len(speech_audio)]
+    else:
+        noise_audio = noise_audio[0: len(speech_audio)]
+
+    scaler1 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=10)
+    scaler2 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=15)
+    scaler3 = get_amplitude_scaling_factor(speech_audio, noise_audio, snr=20)
+
+    noise_audio1 = noise_audio * 1 / scaler1
+    noise_audio2 = noise_audio * 1 / scaler2
+    noise_audio3 = noise_audio * 1 / scaler3
+    noise_bare_na1 = os.path.join("%s_%d_5db" % (os.path.splitext(noise_na)[0], i1))
+    noise_bare_na2 = os.path.join("%s_%d_10db" % (os.path.splitext(noise_na)[0], i1))
+    noise_bare_na3 = os.path.join("%s_%d_15db" % (os.path.splitext(noise_na)[0], i1))
+    noise_audio_path1 = os.path.join(workspace, "audios3", "%s.wav" % noise_bare_na1)
+    noise_audio_path2 = os.path.join(workspace, "audios3", "%s.wav" % noise_bare_na2)
+    noise_audio_path3 = os.path.join(workspace, "audios3", "%s.wav" % noise_bare_na3)
+    create_folder(os.path.dirname(noise_audio_path1))
+    create_folder(os.path.dirname(noise_audio_path2))
+    create_folder(os.path.dirname(noise_audio_path3))
+    write_audio(noise_audio_path1, noise_audio1, fs)
+    write_audio(noise_audio_path2, noise_audio2, fs)
+    write_audio(noise_audio_path3, noise_audio3, fs)
+
+    ''''''noise_mfcc1 = mfcc(noise_audio1, winlen=0.016, winstep=0.008, nfilt=64, numcep=32)
+    if len(noise_audio1) % 128 != 0:
+        noise_mfcc1 = noise_mfcc1[:-1]
+    noise_x_3d1 = mat_2d_to_3d(noise_mfcc1, agg_num=n_concat, hop=n_hop)''''''
+    noise_sp1 = calc_sp(noise_audio1, win, n, k)
+    noise_mfcc1 = np.dot(noise_sp1, Hmel)
+    noise_x_3d1 = mat_2d_to_3d(noise_mfcc1, agg_num=n_concat, hop=n_hop)
+    noise_feature1 = log_sp(noise_x_3d1).astype(np.float32)
+    noise_feature_name1 = noise_bare_na1 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", noise_feature_name1)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=noise_feature1)
+        hf.create_dataset('y', data=z_feature)
+    noise_sp2 = calc_sp(noise_audio2, win, n, k)
+    noise_mfcc2 = np.dot(noise_sp2, Hmel)
+    noise_x_3d2 = mat_2d_to_3d(noise_mfcc2, agg_num=n_concat, hop=n_hop)
+    noise_feature2 = log_sp(noise_x_3d2).astype(np.float32)
+    noise_feature_name2 = noise_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", noise_feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=noise_feature2)
+        hf.create_dataset('y', data=z_feature)
+    noise_sp3 = calc_sp(noise_audio3, win, n, k)
+    noise_mfcc3 = np.dot(noise_sp3, Hmel)
+    noise_x_3d3 = mat_2d_to_3d(noise_mfcc3, agg_num=n_concat, hop=n_hop)
+    noise_feature3 = log_sp(noise_x_3d3).astype(np.float32)
+    noise_feature_name3 = noise_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", noise_feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=noise_feature3)
+        hf.create_dataset('y', data=z_feature)
+
+    #speech_audio1 = speech_audio
+    speech_audio2 = speech_audio / 2
+    speech_audio3 = speech_audio / 4
+    speech_bare_na1 = os.path.join("%s_5db" % (os.path.splitext(speech_na)[0]))
+    speech_bare_na2 = os.path.join("%s_10db" % (os.path.splitext(speech_na)[0]))
+    speech_bare_na3 = os.path.join("%s_15db" % (os.path.splitext(speech_na)[0]))
+    speech_audio_path1 = os.path.join(workspace, "audios3", "%s.wav" % speech_bare_na1)
+    speech_audio_path2 = os.path.join(workspace, "audios3", "%s.wav" % speech_bare_na2)
+    speech_audio_path3 = os.path.join(workspace, "audios3", "%s.wav" % speech_bare_na3)
+    create_folder(os.path.dirname(speech_audio_path1))
+    create_folder(os.path.dirname(speech_audio_path2))
+    create_folder(os.path.dirname(speech_audio_path3))
+    #write_audio(speech_audio_path1, speech_audio1, fs)
+    write_audio(speech_audio_path2, speech_audio2, fs)
+    write_audio(speech_audio_path3, speech_audio3, fs)
+
+    ''''''speech_mfcc1 = mfcc(speech_audio1, winlen=0.016, winstep=0.008, nfilt=64, numcep=32)
+    if len(speech_audio1) % 128 != 0:
+        speech_mfcc1 = speech_mfcc1[:-1]
+    speech_x_3d1 = mat_2d_to_3d(speech_mfcc1, agg_num=n_concat, hop=n_hop)
+    speech_sp1 = calc_sp(speech_audio1, 'magnitude')
+    speech_x_3d1 = mat_2d_to_3d(speech_sp1, agg_num=n_concat, hop=n_hop)
+    speech_x_3d1 = speech_x_3d1[:, :, 16:128]''''''
+    ''''''speech_sp1 = calc_sp(speech_audio1, win, n, k)
+    speech_mfcc1 = np.dot(speech_sp1, Hmel)
+    speech_x_3d1 = mat_2d_to_3d(speech_mfcc1, agg_num=n_concat, hop=n_hop)
+    speech_feature1 = log_sp(speech_x_3d1).astype(np.float32)
+    speech_feature_name1 = speech_bare_na1 + "_data.h5"
+    out_path = os.path.join(workspace, "features2", speech_feature_name1)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=speech_feature1)
+        hf.create_dataset('y', data=y_feature)''''''
+    speech_sp2 = calc_sp(speech_audio2, win, n, k)
+    speech_mfcc2 = np.dot(speech_sp2, Hmel)
+    speech_x_3d2 = mat_2d_to_3d(speech_mfcc2, agg_num=n_concat, hop=n_hop)
+    speech_feature2 = log_sp(speech_x_3d2).astype(np.float32)
+    speech_feature_name2 = speech_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", speech_feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=speech_feature2)
+        hf.create_dataset('y', data=y_feature)
+    speech_sp3 = calc_sp(speech_audio3, win, n, k)
+    speech_mfcc3 = np.dot(speech_sp3, Hmel)
+    speech_x_3d3 = mat_2d_to_3d(speech_mfcc3, agg_num=n_concat, hop=n_hop)
+    speech_feature3 = log_sp(speech_x_3d3).astype(np.float32)
+    speech_feature_name3 = speech_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", speech_feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=speech_feature3)
+        hf.create_dataset('y', data=y_feature)
+
+    #mixed_audio1 = additive_mixing(speech_audio1, noise_audio1, vad)
+    mixed_audio2 = additive_mixing(speech_audio2, noise_audio2, vad)
+    mixed_audio3 = additive_mixing(speech_audio3, noise_audio3, vad)
+    out_bare_na1 = os.path.join("%s_%s_5db" % (os.path.splitext(speech_na)[0], os.path.splitext(noise_na)[0]))
+    out_bare_na2 = os.path.join("%s_%s_10db" % (os.path.splitext(speech_na)[0], os.path.splitext(noise_na)[0]))
+    out_bare_na3 = os.path.join("%s_%s_15db" % (os.path.splitext(speech_na)[0], os.path.splitext(noise_na)[0]))
+    out_audio_path1 = os.path.join(workspace, "audios3", "%s.wav" % out_bare_na1)
+    out_audio_path2 = os.path.join(workspace, "audios3", "%s.wav" % out_bare_na2)
+    out_audio_path3 = os.path.join(workspace, "audios3", "%s.wav" % out_bare_na3)
+    create_folder(os.path.dirname(out_audio_path1))
+    create_folder(os.path.dirname(out_audio_path2))
+    create_folder(os.path.dirname(out_audio_path3))
+    #write_audio(out_audio_path1, mixed_audio1, fs)
+    write_audio(out_audio_path2, mixed_audio2, fs)
+    write_audio(out_audio_path3, mixed_audio3, fs)
+    ''''''mixed_sp1 = calc_sp(mixed_audio1, win, n, k)
+    mixed_mfcc1 = np.dot(mixed_sp1, Hmel)
+    mixed_x_3d1 = mat_2d_to_3d(mixed_mfcc1, agg_num=n_concat, hop=n_hop)
+    x_feature1 = log_sp(mixed_x_3d1).astype(np.float32)
+    feature_name1 = out_bare_na1 + "_data.h5"
+    out_path = os.path.join(workspace, "features2", feature_name1)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature1)
+        hf.create_dataset('y', data=y_feature)''''''
+    mixed_sp2 = calc_sp(mixed_audio2, win, n, k)
+    mixed_mfcc2 = np.dot(mixed_sp2, Hmel)
+    mixed_x_3d2 = mat_2d_to_3d(mixed_mfcc2, agg_num=n_concat, hop=n_hop)
+    x_feature2 = log_sp(mixed_x_3d2).astype(np.float32)
+    feature_name2 = out_bare_na2 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", feature_name2)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature2)
+        hf.create_dataset('y', data=y_feature)
+    mixed_sp3 = calc_sp(mixed_audio3, win, n, k)
+    mixed_mfcc3 = np.dot(mixed_sp3, Hmel)
+    mixed_x_3d3 = mat_2d_to_3d(mixed_mfcc3, agg_num=n_concat, hop=n_hop)
+    x_feature3 = log_sp(mixed_x_3d3).astype(np.float32)
+    feature_name3 = out_bare_na3 + "_data.h5"
+    out_path = os.path.join(workspace, "features3", feature_name3)
+    with h5py.File(out_path, 'w') as hf:
+        hf.create_dataset('x', data=x_feature3)
+        hf.create_dataset('y', data=y_feature)
+
+    print(i1) '''
+
+
